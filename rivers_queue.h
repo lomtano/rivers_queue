@@ -257,77 +257,255 @@ uint32_t rivers_queue_get_item_size(const rivers_queue_t *q);
 rivers_queue_status_t rivers_queue_reset(rivers_queue_t *q);
 
 /*
- * 串口接收队列示例。
+ * main.c 风格示例：UART RX / TX 两个固定单元环形队列。
  *
- * 这个示例展示最常见的用法：UART 接收中断里快速把收到的字节入队，
- * 主循环里从队列取出字节并做协议解析。示例使用 HAL 风格函数名，
- * 但 rivers_queue 本身不依赖 HAL。
+ * 这个示例使用 STM32 HAL 风格函数名，方便放进常见 CubeMX 工程理解；
+ * rivers_queue 本身不依赖 HAL、CMSIS、串口驱动或任何 RTOS。
+ *
+ * 设计要点：
+ * - 主示例使用内部默认静态堆：rivers_mem_init(NULL, 0)。
+ * - RX 队列：UART 接收中断里逐字节接收，把 byte 封装成 uart_rx_msg_t 后快速入队。
+ * - TX 队列：主循环把待发送字符串内容拷贝到 uart_tx_msg_t.text[] 后入队，
+ *   再由主循环从 TX 队列取出并调用 HAL_UART_Transmit() 发送。
+ * - 示例增加按行回显验证：主循环收到一行后，通过 TX 队列打印 "RX: <line>\r\n"。
+ * - 队列满时不阻塞、不覆盖旧数据，直接丢弃并增加 drop 计数。
+ * - 中断里只做快速入队和重新启动接收，不做复杂协议解析、printf 或字符串发送。
+ * - 主循环负责 RX 出队后的组帧/解析，以及 TX 出队后的实际发送。
+ * - 队列创建后，UART_RX_QUEUE_LEN、UART_TX_QUEUE_LEN、sizeof(uart_rx_msg_t)、
+ *   sizeof(uart_tx_msg_t) 都固定不变；rivers_queue 是固定单元大小、固定数量的 ring buffer。
+ * - send / recv / from_isr 都是非阻塞立即尝试；本模块不提供 timeout、阻塞等待、任务唤醒等 RTOS 语义。
  *
  * #include "rivers_queue.h"
+ * #include <string.h>
  *
+ * // RX 队列按字节缓存，因此一个队列单元只需要保存 1 个 byte。
+ * // 中断回调里只把硬件收到的字节搬进队列，后续组帧/解析放到主循环。
  * typedef struct {
  *     uint8_t byte;
  * } uart_rx_msg_t;
  *
- * #define UART_RX_QUEUE_LEN 128
+ * // TX 队列保存待发送字符串消息。
+ * // len 记录本条消息有效长度，text[64] 保存字符串内容副本。
+ * // 队列里保存内容副本，而不是字符串指针，可避免外部 buffer 被修改或失效。
+ * typedef struct {
+ *     uint16_t len;
+ *     char text[64];
+ * } uart_tx_msg_t;
  *
+ * // UART_RX_QUEUE_LEN 表示 RX 队列最多缓存多少个接收字节。
+ * // UART_TX_QUEUE_LEN 表示 TX 队列最多缓存多少条待发送字符串消息。
+ * // UART_RX_LINE_BUF_SIZE 是主循环按行组帧缓存大小，不是 RX 队列容量。
+ * #define UART_RX_QUEUE_LEN 128
+ * #define UART_TX_QUEUE_LEN 8
+ * #define UART_RX_LINE_BUF_SIZE 64
+ *
+ * extern UART_HandleTypeDef huart1;
+ *
+ * // RX / TX 两个队列分别用于中断到主循环的接收通道、主循环到串口发送的打印通道。
  * static rivers_queue_t *s_uart_rx_queue;
+ * static rivers_queue_t *s_uart_tx_queue;
+ *
+ * // HAL_UART_Receive_IT() 使用的单字节接收缓存；调试时可观察它是否变化。
  * static uint8_t s_uart_rx_byte;
  *
- * void app_init(void)
+ * // 队列满时不阻塞等待，只增加 drop 计数，方便观察是否处理不及时或队列长度不足。
+ * static volatile uint32_t s_uart_rx_drop_count;
+ * static volatile uint32_t s_uart_tx_drop_count;
+ *
+ * // 供调试器 Watch 窗口观察当前队列积压数量。
+ * static volatile uint32_t s_uart_rx_count_debug;
+ * static volatile uint32_t s_uart_tx_count_debug;
+ *
+ * // 主循环中使用的按行组帧缓存：普通字符先进入 line_buf，收到 '\n' 后认为一行结束。
+ * static char s_uart_rx_line_buf[UART_RX_LINE_BUF_SIZE];
+ * static uint16_t s_uart_rx_line_len;
+ *
+ * // 把字符串封装成 uart_tx_msg_t 并放入 TX 队列，由 uart_tx_poll() 统一发送。
+ * // 这里使用 memcpy() 把字符串内容拷贝到 msg.text[]，避免只传指针带来的生命周期问题。
+ * // 如果字符串超过 text[] 容量，会按当前消息单元容量截断。
+ * // TX 队列满时只增加 s_uart_tx_drop_count，不阻塞等待。
+ * static void uart_queue_put_string(const char *text)
  * {
+ *     uart_tx_msg_t msg;
+ *     size_t len;
+ *
+ *     if ((text == NULL) || (s_uart_tx_queue == NULL)) {
+ *         return;
+ *     }
+ *
+ *     len = strlen(text);
+ *     if (len > sizeof(msg.text)) {
+ *         len = sizeof(msg.text);
+ *     }
+ *
+ *     msg.len = (uint16_t)len;
+ *     memcpy(msg.text, text, len);
+ *
+ *     if (rivers_queue_send(s_uart_tx_queue, &msg) != RIVERS_QUEUE_OK) {
+ *         s_uart_tx_drop_count++;
+ *     }
+ * }
+ *
+ * // 主循环中的单字节处理函数，用于演示最简单的按行回显。
+ * // '\r' 被忽略，用于兼容串口助手常见的 "\r\n" 行尾。
+ * // 收到 '\n' 表示一行结束，只有此时才通过 TX 队列回显 "RX: xxx\r\n"。
+ * // 普通字符先进入 s_uart_rx_line_buf；行缓存满时清空当前行并提示 overflow。
+ * static void uart_rx_handle_byte(uint8_t byte)
+ * {
+ *     if (byte == '\r') {
+ *         return;
+ *     }
+ *
+ *     if (byte == '\n') {
+ *         if (s_uart_rx_line_len > 0U) {
+ *             s_uart_rx_line_buf[s_uart_rx_line_len] = '\0';
+ *             uart_queue_put_string("RX: ");
+ *             uart_queue_put_string(s_uart_rx_line_buf);
+ *             uart_queue_put_string("\r\n");
+ *             s_uart_rx_line_len = 0U;
+ *         }
+ *         return;
+ *     }
+ *
+ *     if (s_uart_rx_line_len < (UART_RX_LINE_BUF_SIZE - 1U)) {
+ *         s_uart_rx_line_buf[s_uart_rx_line_len] = (char)byte;
+ *         s_uart_rx_line_len++;
+ *     } else {
+ *         s_uart_rx_line_len = 0U;
+ *         uart_queue_put_string("RX line overflow\r\n");
+ *     }
+ * }
+ *
+ * // 运行在主循环中：不断从 RX 队列取出字节，再交给 uart_rx_handle_byte() 组帧/解析。
+ * // 协议解析、命令处理、打印触发都应放在这里，不放在串口中断回调里。
+ * // 前后更新 s_uart_rx_count_debug，便于调试器观察 RX 队列积压变化。
+ * static void uart_rx_poll(void)
+ * {
+ *     uart_rx_msg_t msg;
+ *
+ *     s_uart_rx_count_debug = rivers_queue_get_count(s_uart_rx_queue);
+ *
+ *     while (rivers_queue_recv(s_uart_rx_queue, &msg) == RIVERS_QUEUE_OK) {
+ *         // 在主循环中组帧/解析；中断里只负责快速入队。
+ *         uart_rx_handle_byte(msg.byte);
+ *     }
+ *
+ *     s_uart_rx_count_debug = rivers_queue_get_count(s_uart_rx_queue);
+ * }
+ *
+ * // 运行在主循环中：从 TX 队列取出字符串消息并调用 HAL_UART_Transmit() 发送。
+ * // HAL_UART_Transmit() 是阻塞式发送，本示例用于验证链路；正式项目大量发送时可换成 IT/DMA 发送。
+ * // 前后更新 s_uart_tx_count_debug，便于调试器观察 TX 队列积压变化。
+ * static void uart_tx_poll(void)
+ * {
+ *     uart_tx_msg_t msg;
+ *
+ *     s_uart_tx_count_debug = rivers_queue_get_count(s_uart_tx_queue);
+ *
+ *     while (rivers_queue_recv(s_uart_tx_queue, &msg) == RIVERS_QUEUE_OK) {
+ *         (void)HAL_UART_Transmit(
+ *             &huart1,
+ *             (uint8_t *)msg.text,
+ *             msg.len,
+ *             100U
+ *         );
+ *     }
+ *
+ *     s_uart_tx_count_debug = rivers_queue_get_count(s_uart_tx_queue);
+ * }
+ *
+ * int main(void)
+ * {
+ *     // HAL 工程常规初始化：初始化 HAL、系统时钟和 USART1 外设。
+ *     HAL_Init();
+ *     SystemClock_Config();
+ *     MX_USART1_UART_Init();
+ *
+ *     // 使用 rivers_queue.c 内部默认静态堆，不使用用户自定义 user_queue_heap。
  *     rivers_mem_init(NULL, 0);
  *
+ *     // 创建 RX 队列：固定缓存 UART_RX_QUEUE_LEN 个 uart_rx_msg_t 单元。
  *     s_uart_rx_queue = rivers_queue_create(
  *         UART_RX_QUEUE_LEN,
  *         sizeof(uart_rx_msg_t)
  *     );
  *
- *     // 示例为 HAL 工程写法，rivers_queue 本身不依赖 HAL。
- *     // HAL_UART_Receive_IT(&huart1, &s_uart_rx_byte, 1);
+ *     // 创建 TX 队列：固定缓存 UART_TX_QUEUE_LEN 个 uart_tx_msg_t 单元。
+ *     s_uart_tx_queue = rivers_queue_create(
+ *         UART_TX_QUEUE_LEN,
+ *         sizeof(uart_tx_msg_t)
+ *     );
+ *
+ *     if ((s_uart_rx_queue == NULL) || (s_uart_tx_queue == NULL)) {
+ *         while (1) {
+ *             // 队列创建失败，通常是 RIVERS_QUEUE_HEAP_SIZE 不足或参数配置错误。
+ *         }
+ *     }
+ *
+ *     // 启动第一次 1 字节中断接收；后续每次接收完成后在回调里重新启动。
+ *     (void)HAL_UART_Receive_IT(&huart1, &s_uart_rx_byte, 1U);
+ *
+ *     // 启动提示字符串先进入 TX 队列，随后由 uart_tx_poll() 统一发送。
+ *     uart_queue_put_string("rivers_queue start\r\n");
+ *     uart_queue_put_string("send a line and press enter\r\n");
+ *
+ *     while (1) {
+ *         // 周期性轮询 RX/TX 队列；调用越及时，队列积压和丢弃风险越低。
+ *         uart_rx_poll();
+ *         uart_tx_poll();
+ *
+ *         // 其他主循环业务可以放在这里；不要长时间阻塞，否则 RX/TX 队列处理会变慢。
+ *     }
  * }
  *
+ * // HAL 串口接收完成回调。
+ * // 这里只把收到的 1 个字节放入 RX 队列，并重新开启下一次接收。
+ * // 不要在这里做协议解析、printf、HAL_UART_Transmit() 或其他耗时业务。
  * void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
  * {
  *     if (huart == &huart1) {
  *         uart_rx_msg_t msg;
+ *
  *         msg.byte = s_uart_rx_byte;
  *
- *         // 如果队列满，会返回 RIVERS_QUEUE_ERR_FULL，可按需求统计丢包或设置溢出标志。
- *         (void)rivers_queue_send_from_isr(s_uart_rx_queue, &msg);
+ *         if (rivers_queue_send_from_isr(s_uart_rx_queue, &msg) != RIVERS_QUEUE_OK) {
+ *             s_uart_rx_drop_count++;
+ *         }
  *
- *         // 继续启动下一次接收。
- *         // HAL_UART_Receive_IT(&huart1, &s_uart_rx_byte, 1);
+ *         (void)HAL_UART_Receive_IT(&huart1, &s_uart_rx_byte, 1U);
  *     }
  * }
  *
- * void app_loop(void)
- * {
- *     uart_rx_msg_t msg;
+ * 验证方法：
+ * - 串口助手发送 hello rivers，并设置发送结尾为 "\r\n" 或 "\n"。
+ * - 正常应收到回显：RX: hello rivers。
+ * - 如果没有发送换行符，数据会暂存在 s_uart_rx_line_buf 中，不会立即打印。
+ * - 可以在调试器 Watch 中观察：s_uart_rx_byte、s_uart_rx_drop_count、
+ *   s_uart_tx_drop_count、s_uart_rx_count_debug、s_uart_tx_count_debug、
+ *   s_uart_rx_line_len、s_uart_rx_line_buf。
+ * - 如果 s_uart_rx_byte 变化，说明中断接收到数据。
+ * - 如果 s_uart_rx_drop_count 增加，说明 RX 队列处理不及时或长度不足。
+ * - 如果 s_uart_tx_drop_count 增加，说明 TX 队列积压或发送不及时。
+ * - 如果 s_uart_rx_line_buf 有内容但没有回显，通常是没有收到 '\n'。
+ * - 如果启动字符串能打印但回显不工作，优先检查 HAL_UART_Receive_IT 是否成功启动，以及回调是否进入。
  *
- *     while (rivers_queue_recv(s_uart_rx_queue, &msg) == RIVERS_QUEUE_OK) {
- *         // 在主循环中处理收到的字节，例如协议解析、帧组包、命令处理等。
- *         // uart_protocol_parse_byte(msg.byte);
- *     }
- * }
+ * 高速串口建议：
+ * - 当前示例是逐字节中断接收并逐字节入队，适合低速串口或普通功能验证。
+ * - 如果串口速率很高，逐字节中断和逐字节入队压力较大。
+ * - 正式项目可以改成 DMA + IDLE 中断，把帧长度、缓冲区指针或帧事件放入队列。
+ * - 这时队列传递的就不是单字节，而是“帧事件”或“缓冲区描述符”。
  *
- * 说明：
- * - 中断里只负责快速入队，不做复杂解析。
- * - 主循环里负责出队和协议解析。
- * - 如果串口速率很高，逐字节入队压力较大，可以改成 DMA + IDLE 中断，
- *   把帧长度、缓冲区指针或帧事件入队。
- * - 队列创建后，UART_RX_QUEUE_LEN 和 sizeof(uart_rx_msg_t) 固定不变。
- * - 如果不想使用内部默认静态堆，也可以自己提供一块内存池：
+ * 如果不想使用内部默认静态堆，也可以自己提供一块内存池。
+ * 这只是补充方式，不是上面主示例的主线：
  *
- *   static uint8_t user_queue_heap[2048];
+ * static uint8_t user_queue_heap[2048];
  *
- *   rivers_mem_init(user_queue_heap, sizeof(user_queue_heap));
- *   s_uart_rx_queue = rivers_queue_create(UART_RX_QUEUE_LEN, sizeof(uart_rx_msg_t));
+ * rivers_mem_init(user_queue_heap, sizeof(user_queue_heap));
  */
-
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* RIVERS_QUEUE_H */
+
 
